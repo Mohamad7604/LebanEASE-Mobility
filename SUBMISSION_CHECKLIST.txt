@@ -1,0 +1,29 @@
+LebanEASE Mobility - Final Submission Checklist
+
+Main SRS fixes completed in this version:
+1. Trip search now requires source, destination, and date.
+2. Trip scheduling rejects arrival time that is not later than departure time.
+3. Trip scheduling requires scheduled trips to have a future departure date/time.
+4. Seat reservation now requires passenger login; the old guest booking flow is disabled.
+5. Bus deletion now explicitly blocks permanent deletion when the bus is assigned to an uncancelled future trip.
+6. Reports are admin-only and no longer expose passenger/report data publicly.
+7. Database-level unique protection prevents duplicate active seats and duplicate active passenger reservations per trip.
+8. Navigation headers and button colors were polished for a more consistent UI.
+
+Recommended demo flow:
+1. Import database/LebanEase_updated.sql into MySQL/phpMyAdmin.
+2. Update db/config.php if your database username/password is different.
+3. Open index.php in browser through XAMPP/Apache.
+4. Admin login: use the seeded admin account from the SQL file.
+5. Passenger: create/register a passenger account, search a trip, select/auto-assign a seat, then view/cancel it from My Reservations.
+
+Seeded demo credentials:
+- Admin: admin@lebanease.com / admin123
+- Passenger: hassane / pass123
+
+Extra features kept:
+- The Admin Smart Assistant is still available from the admin dashboard.
+- Payment pages/buttons were removed to keep the MVP aligned with the SRS. Estimated fare is still displayed as information only.
+
+Important note:
+- The SRS-based reservation flow still requires passenger login before confirming a reservation. This keeps the project aligned with the SRS requirement that authenticated passengers reserve seats.

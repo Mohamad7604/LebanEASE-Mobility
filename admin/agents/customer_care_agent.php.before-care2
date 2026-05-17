@@ -1,0 +1,349 @@
+<?php
+/**
+ * Customer Care Specialist Agent
+ * --------------------------------
+ * Owns: passengers, communications, refunds, complaint handling.
+ *
+ * Pairs with the Dispatcher: when a schedule changes (cancellation, bus swap,
+ * retime), the Orchestrator consults Customer Care to identify affected
+ * passengers, draft notifications in their language, and (optionally)
+ * propose refunds. Customer Care PROPOSES; the admin approves; commit.php
+ * executes inside the atomic plan transaction.
+ */
+require_once __DIR__ . '/tools.php';
+
+// =========================================================================
+// CUSTOMER CARE TOOL IMPLEMENTATIONS
+// =========================================================================
+function customer_care_tool(string $name, array $args) {
+    try {
+        switch ($name) {
+
+            // -----------------------------------------------------------------
+            // Find all passengers booked on a specific schedule.
+            // Returns full names + contact info so the agent can craft messages.
+            // -----------------------------------------------------------------
+            case 'find_passengers_on_schedule': {
+                $sid = (int)($args['schedule_id'] ?? 0);
+                if ($sid <= 0) return ['error' => 'schedule_id required'];
+
+                $stmt = db()->prepare(
+                    "SELECT r.Reservation_ID, r.Seat_Number, r.Status AS Reservation_Status,
+                            p.Passenger_ID,
+                            CONCAT(COALESCE(p.First_Name,''),' ',COALESCE(p.Last_Name,'')) AS Full_Name,
+                            p.Email, p.Phone,
+                            s.Date AS Trip_Date, s.Departure_Time, s.Arrival_Time,
+                            rt.Source, rt.Destination,
+                            b.Bus_Number
+                     FROM reservation r
+                     JOIN passenger p   ON r.Passenger_ID = p.Passenger_ID
+                     JOIN bus_schedule s ON r.Schedule_ID  = s.Schedule_ID
+                     JOIN route rt      ON s.Route_ID     = rt.Route_ID
+                     JOIN bus b         ON s.Bus_ID       = b.Bus_ID
+                     WHERE r.Schedule_ID = :sid
+                       AND r.Status = 'Active'
+                     ORDER BY r.Seat_Number"
+                );
+                $stmt->execute([':sid' => $sid]);
+                $rows = $stmt->fetchAll();
+                return [
+                    'schedule_id' => $sid,
+                    'passengers'  => $rows,
+                    'count'       => count($rows),
+                ];
+            }
+
+            // -----------------------------------------------------------------
+            // Find all passengers on every active future schedule for a given
+            // bus. Used after a breakdown to identify everyone affected
+            // across multiple trips at once.
+            // -----------------------------------------------------------------
+            case 'find_passengers_on_bus_future': {
+                $bus = (int)($args['bus_id'] ?? 0);
+                if ($bus <= 0) return ['error' => 'bus_id required'];
+
+                $stmt = db()->prepare(
+                    "SELECT s.Schedule_ID, s.Date, s.Departure_Time,
+                            r.Reservation_ID, r.Seat_Number,
+                            p.Passenger_ID,
+                            CONCAT(COALESCE(p.First_Name,''),' ',COALESCE(p.Last_Name,'')) AS Full_Name,
+                            p.Email, p.Phone,
+                            rt.Source, rt.Destination
+                     FROM bus_schedule s
+                     JOIN reservation r ON s.Schedule_ID = r.Schedule_ID
+                     JOIN passenger p   ON r.Passenger_ID = p.Passenger_ID
+                     JOIN route rt      ON s.Route_ID = rt.Route_ID
+                     WHERE s.Bus_ID = :b
+                       AND s.Status = 'Scheduled'
+                       AND r.Status = 'Active'
+                       AND TIMESTAMP(s.Date, s.Departure_Time) >= NOW()
+                     ORDER BY s.Date, s.Departure_Time, r.Seat_Number"
+                );
+                $stmt->execute([':b' => $bus]);
+                $rows = $stmt->fetchAll();
+                return [
+                    'bus_id'           => $bus,
+                    'affected_bookings'=> $rows,
+                    'count'            => count($rows),
+                ];
+            }
+
+            // -----------------------------------------------------------------
+            // Draft a per-passenger notification message in the chosen language.
+            // Returns the rendered text only - does NOT add to the plan.
+            // Use propose_notification next to surface it as an approvable action.
+            // -----------------------------------------------------------------
+            case 'draft_notification': {
+                $passengers = $args['passengers'] ?? [];          // array of passenger objects
+                $situation  = strtolower($args['situation'] ?? 'change');  // 'cancellation' | 'bus_swap' | 'retime' | 'change'
+                $language   = strtolower($args['language'] ?? 'en');
+                $context    = $args['context'] ?? [];             // route info, new times, etc.
+
+                if (!is_array($passengers) || !$passengers) {
+                    return ['error' => 'passengers array required'];
+                }
+
+                $route       = $context['route']        ?? '';
+                $trip_date   = $context['trip_date']    ?? '';
+                $old_time    = $context['old_time']     ?? '';
+                $new_time    = $context['new_time']     ?? '';
+                $new_bus     = $context['new_bus']      ?? '';
+
+                $drafts = [];
+                foreach ($passengers as $p) {
+                    $name = $p['Full_Name'] ?? $p['name'] ?? 'valued passenger';
+                    $seat = $p['Seat_Number'] ?? '';
+
+                    if ($language === 'ar') {
+                        switch ($situation) {
+                            case 'cancellation':
+                                $text = "مرحبًا {$name}، نأسف لإبلاغك بأن رحلتك ({$route}) بتاريخ {$trip_date} الساعة {$old_time} (المقعد {$seat}) قد أُلغيت. سيتم رد المبلغ كاملًا. — LebanEASE";
+                                break;
+                            case 'bus_swap':
+                                $text = "مرحبًا {$name}، تم تغيير الحافلة لرحلتك ({$route}) بتاريخ {$trip_date} الساعة {$old_time}. سيتم تشغيل الحافلة {$new_bus} في نفس الوقت ومن نفس المحطة، ومقعدك ({$seat}) محجوز. — LebanEASE";
+                                break;
+                            case 'retime':
+                                $text = "مرحبًا {$name}، تم تعديل وقت رحلتك ({$route}) بتاريخ {$trip_date}: المغادرة الجديدة الساعة {$new_time} بدلًا من {$old_time}. مقعدك ({$seat}) محفوظ. — LebanEASE";
+                                break;
+                            default:
+                                $text = "مرحبًا {$name}، طرأ تغيير على حجزك ({$route}) بتاريخ {$trip_date}. يرجى الاطلاع على التفاصيل في حسابك. — LebanEASE";
+                        }
+                    } elseif ($language === 'fr') {
+                        switch ($situation) {
+                            case 'cancellation':
+                                $text = "Bonjour {$name}, nous regrettons de vous informer que votre voyage ({$route}) du {$trip_date} à {$old_time} (siège {$seat}) a été annulé. Un remboursement complet sera traité. — LebanEASE";
+                                break;
+                            case 'bus_swap':
+                                $text = "Bonjour {$name}, le bus de votre trajet ({$route}) du {$trip_date} à {$old_time} a été changé. Le bus {$new_bus} assurera le service au même horaire et depuis la même station ; votre siège ({$seat}) est conservé. — LebanEASE";
+                                break;
+                            case 'retime':
+                                $text = "Bonjour {$name}, l'horaire de votre voyage ({$route}) du {$trip_date} a changé : nouveau départ à {$new_time} au lieu de {$old_time}. Votre siège ({$seat}) est conservé. — LebanEASE";
+                                break;
+                            default:
+                                $text = "Bonjour {$name}, une modification a été apportée à votre réservation ({$route}) du {$trip_date}. Consultez les détails dans votre compte. — LebanEASE";
+                        }
+                    } else { // English default
+                        switch ($situation) {
+                            case 'cancellation':
+                                $text = "Hi {$name}, we regret to inform you that your trip ({$route}) on {$trip_date} at {$old_time} (seat {$seat}) has been cancelled. A full refund will be processed. — LebanEASE";
+                                break;
+                            case 'bus_swap':
+                                $text = "Hi {$name}, the bus for your trip ({$route}) on {$trip_date} at {$old_time} has been changed. Bus {$new_bus} will operate the same route at the same time and station; your seat ({$seat}) is reserved. — LebanEASE";
+                                break;
+                            case 'retime':
+                                $text = "Hi {$name}, the time of your trip ({$route}) on {$trip_date} has changed: new departure at {$new_time} instead of {$old_time}. Your seat ({$seat}) is held. — LebanEASE";
+                                break;
+                            default:
+                                $text = "Hi {$name}, a change has been made to your reservation ({$route}) on {$trip_date}. Please check your account for details. — LebanEASE";
+                        }
+                    }
+
+                    $drafts[] = [
+                        'reservation_id' => $p['Reservation_ID'] ?? null,
+                        'passenger_id'   => $p['Passenger_ID']   ?? null,
+                        'name'           => $name,
+                        'email'          => $p['Email'] ?? null,
+                        'phone'          => $p['Phone'] ?? null,
+                        'language'       => $language,
+                        'situation'      => $situation,
+                        'message'        => $text,
+                    ];
+                }
+                return [
+                    'drafts' => $drafts,
+                    'count'  => count($drafts),
+                    'note'   => 'These are drafts only. Use propose_notification to surface them for admin approval.',
+                ];
+            }
+
+            // -----------------------------------------------------------------
+            // Record an INTENT to issue a refund. Plan-time only.
+            // The commit endpoint executes `refund_reservation` actions, which
+            // update reservation.Status = 'Refunded' inside the transaction.
+            // -----------------------------------------------------------------
+            case 'propose_refund': {
+                $rid     = (int)($args['reservation_id'] ?? 0);
+                $reason  = $args['reason'] ?? 'schedule change';
+                if ($rid <= 0) return ['error' => 'reservation_id required'];
+
+                // Sanity check the reservation exists and is currently Active
+                $chk = db()->prepare(
+                    "SELECT r.Reservation_ID, r.Status, r.Seat_Number,
+                            CONCAT(COALESCE(p.First_Name,''),' ',COALESCE(p.Last_Name,'')) AS Full_Name
+                     FROM reservation r JOIN passenger p ON r.Passenger_ID = p.Passenger_ID
+                     WHERE r.Reservation_ID = :rid"
+                );
+                $chk->execute([':rid' => $rid]);
+                $row = $chk->fetch();
+                if (!$row) return ['error' => "reservation {$rid} not found"];
+                if (strtolower($row['Status']) !== 'active') {
+                    return ['error' => "reservation {$rid} is {$row['Status']}, cannot refund"];
+                }
+                return [
+                    'proposed' => 'refund_reservation',
+                    'reservation_id' => $rid,
+                    'passenger'      => $row['Full_Name'],
+                    'seat'           => $row['Seat_Number'],
+                    'reason'         => $reason,
+                ];
+            }
+
+            // -----------------------------------------------------------------
+            // Mark a draft notification as "to be sent" - this becomes a
+            // notify_passenger action in the plan, executed by commit.php.
+            // -----------------------------------------------------------------
+            case 'propose_notification': {
+                $drafts = $args['drafts'] ?? [];
+                if (!is_array($drafts) || !$drafts) return ['error' => 'drafts array required'];
+                return [
+                    'proposed'    => 'notify_passenger',
+                    'count'       => count($drafts),
+                    'drafts'      => $drafts,
+                ];
+            }
+        }
+
+        return ['error' => "unknown customer_care tool: {$name}"];
+    } catch (Throwable $e) {
+        return ['error' => $e->getMessage()];
+    }
+}
+
+// =========================================================================
+// CUSTOMER CARE TOOL SCHEMA (OpenAI function-calling format)
+// =========================================================================
+function customer_care_tools(): array {
+    return [
+        ['type' => 'function', 'function' => [
+            'name' => 'find_passengers_on_schedule',
+            'description' => 'List passengers currently booked on a specific schedule. Use this when handling cancellations or bus changes to identify who is affected.',
+            'parameters' => [
+                'type' => 'object',
+                'properties' => [
+                    'schedule_id' => ['type' => 'integer'],
+                ],
+                'required' => ['schedule_id'],
+            ],
+        ]],
+        ['type' => 'function', 'function' => [
+            'name' => 'find_passengers_on_bus_future',
+            'description' => 'List every active future booking across every schedule of a specific bus. Use this when a bus needs to be pulled from service entirely (e.g. breakdown) to find all affected passengers in one query.',
+            'parameters' => [
+                'type' => 'object',
+                'properties' => [
+                    'bus_id' => ['type' => 'integer'],
+                ],
+                'required' => ['bus_id'],
+            ],
+        ]],
+        ['type' => 'function', 'function' => [
+            'name' => 'draft_notification',
+            'description' => 'Compose a per-passenger notification in the requested language. Pass the list of passenger objects (from find_passengers_*), the situation type (cancellation, bus_swap, retime, change), the language code (en/ar/fr), and the relevant context (route name, old/new time, new bus number). Returns drafted texts but does NOT add anything to the plan yet.',
+            'parameters' => [
+                'type' => 'object',
+                'properties' => [
+                    'passengers' => ['type' => 'array', 'items' => ['type' => 'object'], 'description' => 'Passenger rows from find_passengers_* tools'],
+                    'situation'  => ['type' => 'string', 'enum' => ['cancellation','bus_swap','retime','change']],
+                    'language'   => ['type' => 'string', 'enum' => ['en','ar','fr']],
+                    'context'    => [
+                        'type' => 'object',
+                        'description' => 'Route name, dates, times, new bus number etc. used in the message template',
+                        'properties' => [
+                            'route'     => ['type' => 'string'],
+                            'trip_date' => ['type' => 'string'],
+                            'old_time'  => ['type' => 'string'],
+                            'new_time'  => ['type' => 'string'],
+                            'new_bus'   => ['type' => 'string'],
+                        ],
+                    ],
+                ],
+                'required' => ['passengers','situation','language'],
+            ],
+        ]],
+        ['type' => 'function', 'function' => [
+            'name' => 'propose_notification',
+            'description' => 'Promote drafted notifications into approvable plan actions. Pass the drafts array returned by draft_notification.',
+            'parameters' => [
+                'type' => 'object',
+                'properties' => [
+                    'drafts' => ['type' => 'array', 'items' => ['type' => 'object']],
+                ],
+                'required' => ['drafts'],
+            ],
+        ]],
+        ['type' => 'function', 'function' => [
+            'name' => 'propose_refund',
+            'description' => 'Propose a refund on one reservation. The admin will approve via the plan card; commit.php updates reservation.Status to Refunded.',
+            'parameters' => [
+                'type' => 'object',
+                'properties' => [
+                    'reservation_id' => ['type' => 'integer'],
+                    'reason'         => ['type' => 'string'],
+                ],
+                'required' => ['reservation_id','reason'],
+            ],
+        ]],
+    ];
+}
+
+// =========================================================================
+// CUSTOMER CARE AGENT LOOP ENTRYPOINT
+// =========================================================================
+function run_customer_care_agent(string $question): array {
+    $today = date('Y-m-d');
+    $system = <<<SYS
+You are the Customer Care Specialist for a Lebanese bus operator.
+
+Your domain: PASSENGERS — identifying who is booked on a trip, drafting notifications about changes, and proposing refunds for cancelled trips.
+
+How you work:
+1. Read the question carefully. It comes from the Orchestrator and may include a [respond_in: en|ar|fr] directive at the start - mirror that language in your prose.
+2. Use find_passengers_on_schedule or find_passengers_on_bus_future to identify affected passengers.
+3. Use draft_notification to compose per-passenger messages in their language. The available situation types are: cancellation, bus_swap, retime, change. Pass route name, dates, and times so the templates render with real data, not placeholders.
+4. Use propose_notification to promote the drafts into plan actions the admin can approve.
+5. For cancellations and major service failures, also call propose_refund for each affected active reservation.
+6. NEVER fabricate passenger names, IDs, or contact info. Everything comes from your tools.
+7. NEVER actually send anything yourself. You propose; the admin approves; commit.php records the actions in the audit log.
+8. Be concise in your summary. The Orchestrator will package your proposed actions into the final plan card.
+
+Today is {$today}.
+SYS;
+
+    $result = run_agent_loop(
+        $system,
+        $question,
+        customer_care_tools(),
+        'customer_care_tool'
+    );
+
+    log_agent_action('customer_care', 'consulted', [
+        'question' => $question,
+        'steps'    => count($result['trace']),
+    ]);
+
+    return [
+        'agent'  => 'customer_care',
+        'answer' => $result['final_text'],
+        'trace'  => $result['trace'],
+    ];
+}

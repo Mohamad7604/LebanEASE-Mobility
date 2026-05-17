@@ -1,0 +1,16 @@
+# OS / editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs and temp files
+*.log
+*.tmp
+*.bak
+
+# Secrets
+.env
+.env.local
+admin/ai_config_secret.php
+admin/ai_config_local.php
